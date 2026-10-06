@@ -21,7 +21,7 @@ import { nowIso, round, shiftDate, todayDate, uuid } from './format';
 export const DB_NAME = 'gbpvstring';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -57,7 +57,7 @@ class PvStringDatabase extends Dexie {
 
     // v2：新增 revision 行修订号；组串补充 moduleModel 索引，处置单补充 owner 索引；
     //     采样表补充组合索引便于按组串+时间取窗口
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         plants: 'id, name, gridDate, latitude, capacityMWp',
         arrays: 'id, plantId, code, capacityKw',
@@ -94,6 +94,42 @@ class PvStringDatabase extends Dexie {
         const existing = (await settings.get('threshold')) as ThresholdRow | undefined;
         if (!existing) {
           await settings.put({ ...DEFAULT_THRESHOLDS, id: 'threshold', updatedAt: nowIso() });
+        }
+      });
+
+    // v3：采集读数支持「不计入统计」开关与辐照度来源追溯（缺测补齐：同箱中位 → 沿用上条 → 超时退出）；
+    //     阈值配置新增 irradianceCarryLimitMin（辐照度沿用时限，分钟）
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        plants: 'id, name, gridDate, latitude, capacityMWp',
+        arrays: 'id, plantId, code, capacityKw',
+        inverters: 'id, arrayId, model, ratedKw',
+        strings: 'id, inverterId, combinerBox, code, moduleModel',
+        samples: 'id, stringId, sampledAt, [stringId+sampledAt]',
+        disposals: 'id, stringId, state, type, owner, dueDate',
+        settings: 'id',
+      })
+      .upgrade(async (tx) => {
+        // 迁移：历史读数默认参与统计，辐照度按实测口径补齐来源与有效值
+        await tx.table('samples').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.excludedFromStats !== 'boolean') row.excludedFromStats = false;
+          const raw = typeof row.irradianceWm2 === 'number' && row.irradianceWm2 > 0 ? row.irradianceWm2 : null;
+          row.irradianceWm2 = raw;
+          if (typeof row.irradianceSource !== 'string') {
+            row.irradianceSource = raw !== null ? 'measured' : 'missing';
+          }
+          if (typeof row.effectiveIrradianceWm2 !== 'number') {
+            row.effectiveIrradianceWm2 = raw;
+          }
+        });
+        // 迁移：阈值配置补 irradianceCarryLimitMin 默认值
+        const settings = tx.table('settings');
+        const existing = (await settings.get('threshold')) as ThresholdRow | undefined;
+        if (existing && typeof existing.irradianceCarryLimitMin !== 'number') {
+          await settings.put({
+            ...existing,
+            irradianceCarryLimitMin: DEFAULT_THRESHOLDS.irradianceCarryLimitMin,
+          });
         }
       });
   }
@@ -315,6 +351,9 @@ async function seedDatabase(): Promise<void> {
                 currentA,
                 voltageV: round(boxPlan.seriesCount * 41.6 + random() * 22, 1),
                 irradianceWm2: irradiance,
+                irradianceSource: 'measured',
+                effectiveIrradianceWm2: irradiance,
+                excludedFromStats: false,
                 discreteRate: 0,
                 createdAt: stamp,
                 revision: ROW_REVISION,
@@ -581,7 +620,10 @@ export async function removeDisposal(id: string): Promise<void> {
 
 export async function getThresholds(): Promise<ThresholdRow> {
   const row = await db.settings.get('threshold');
-  return row ?? { ...DEFAULT_THRESHOLDS, id: 'threshold', updatedAt: nowIso() };
+  // 合并默认值：旧版备份导入后可能缺少新增阈值字段（如 irradianceCarryLimitMin）
+  return row
+    ? { ...DEFAULT_THRESHOLDS, ...row }
+    : { ...DEFAULT_THRESHOLDS, id: 'threshold', updatedAt: nowIso() };
 }
 
 export async function putThresholds(row: ThresholdRow): Promise<void> {

@@ -21,9 +21,17 @@ import {
   type StringRow,
 } from '../utils/db';
 import type { SampleDraft, SampleRow as SampleViewRow, StringDiscreteStat } from '../types/sample';
+import { isSampleCountable } from '../types/sample';
 import type { ThresholdConfig } from '../types/settings';
 import { DEFAULT_THRESHOLDS } from '../types/settings';
-import { buildStringStats, discreteRate, normalizeCurrent } from '../utils/discrete';
+import {
+  applyIrradianceResolution,
+  buildStringStats,
+  discreteRate,
+  effectiveIrradianceOf,
+  normalizeCurrent,
+  resolveIrradianceSources,
+} from '../utils/discrete';
 import { nowIso, uuid } from '../utils/format';
 import { emitChange, subscribeChange } from '../utils/events';
 
@@ -47,6 +55,8 @@ interface SampleStoreState {
   updateSample: (sampleId: string, draft: SampleDraft) => Promise<void>;
   deleteSample: (sampleId: string) => Promise<void>;
   deleteSamplesOfString: (stringId: string) => Promise<void>;
+  /** 复核开关：剔除（不计入统计）/ 重新计入，原始读数保留 */
+  setSampleExcluded: (sampleId: string, excluded: boolean) => Promise<void>;
   toggleMark: (stringId: string) => void;
   markMany: (stringIds: string[]) => void;
   clearMarks: () => void;
@@ -66,7 +76,13 @@ function hydrateStats(
   plants: PlantRow[],
   thresholds: ThresholdConfig,
 ): StringDiscreteStat[] {
-  const base = buildStringStats(samples, thresholds);
+  // 现场解析辐照度来源（沿用时限等阈值调整后立即生效），再按「计入统计」口径聚合
+  const resolvedSamples = applyIrradianceResolution(
+    samples,
+    strings,
+    thresholds.irradianceCarryLimitMin ?? 30,
+  );
+  const base = buildStringStats(resolvedSamples, thresholds);
   return base.map((stat) => {
     const owner = strings.find((item) => item.id === stat.stringId);
     const inverter = owner ? inverters.find((item) => item.id === owner.inverterId) : undefined;
@@ -150,6 +166,10 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
       currentA: draft.currentA,
       voltageV: draft.voltageV,
       irradianceWm2: draft.irradianceWm2,
+      // 辐照度来源先按实测/缺测占位，recalcDiscreteRate 会按同箱口径重解析
+      irradianceSource: draft.irradianceWm2 !== null && draft.irradianceWm2 > 0 ? 'measured' : 'missing',
+      effectiveIrradianceWm2: draft.irradianceWm2 !== null && draft.irradianceWm2 > 0 ? draft.irradianceWm2 : null,
+      excludedFromStats: false,
       discreteRate: 0,
       createdAt: nowIso(),
       revision: ROW_REVISION,
@@ -171,6 +191,10 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
         currentA: draft.currentA,
         voltageV: draft.voltageV,
         irradianceWm2: draft.irradianceWm2,
+        irradianceSource: draft.irradianceWm2 !== null && draft.irradianceWm2 > 0 ? 'measured' : 'missing',
+        effectiveIrradianceWm2:
+          draft.irradianceWm2 !== null && draft.irradianceWm2 > 0 ? draft.irradianceWm2 : null,
+        excludedFromStats: false,
         discreteRate: 0,
         createdAt: nowIso(),
         revision: ROW_REVISION,
@@ -217,6 +241,15 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
     emitChange();
   },
 
+  async setSampleExcluded(sampleId, excluded) {
+    const existing = get().samples.find((item) => item.id === sampleId);
+    if (!existing) return;
+    // 只翻开关不删行：原始读数保留可查看，重新计入即可恢复统计
+    await putSample({ ...existing, excludedFromStats: excluded });
+    await get().recalcDiscreteRate(existing.stringId);
+    emitChange();
+  },
+
   toggleMark(stringId) {
     set((state) => ({
       markedStringIds: state.markedStringIds.includes(stringId)
@@ -235,7 +268,13 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
 
   sampleRows() {
     const { samples, strings, inverters, arrays, plants, thresholds } = get();
-    return samples.map((sample) => {
+    // 与统计同一口径：现场解析辐照度来源，归一化电流用有效辐照度
+    const resolvedSamples = applyIrradianceResolution(
+      samples,
+      strings,
+      thresholds.irradianceCarryLimitMin ?? 30,
+    );
+    return resolvedSamples.map((sample) => {
       const owner = strings.find((item) => item.id === sample.stringId);
       const inverter = owner ? inverters.find((item) => item.id === owner.inverterId) : undefined;
       const array = inverter ? arrays.find((item) => item.id === inverter.arrayId) : undefined;
@@ -250,7 +289,7 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
         arrayCode: array?.code ?? '-',
         plantId: plant?.id ?? '',
         plantName: plant?.name ?? '未归属电站',
-        normalizedCurrentA: normalizeCurrent(sample.currentA, sample.irradianceWm2, thresholds),
+        normalizedCurrentA: normalizeCurrent(sample.currentA, effectiveIrradianceOf(sample), thresholds),
       };
     });
   },
@@ -270,19 +309,42 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   },
 
   async recalcDiscreteRate(stringId) {
-    const { strings, samples } = get();
+    const { strings, thresholds } = get();
     const owner = strings.find((item) => item.id === stringId);
     if (!owner) return 0;
     const peers = strings.filter(
       (item) => item.inverterId === owner.inverterId && item.combinerBox === owner.combinerBox,
     );
     const peerIds = new Set(peers.map((item) => item.id));
-    const scope = samples.length > 0 ? samples : await listSamples();
+    // 始终读库内最新数据：剔除/恢复、删除、新增落库后 state 快照尚未刷新，用旧快照会算错口径
+    const scope = await listSamples();
     const targets = scope.filter((item) => peerIds.has(item.stringId));
-    const values = targets.slice(-40).map((item) => normalizeCurrent(item.currentA, item.irradianceWm2));
-    const rate = discreteRate(values.length > 0 ? values : [0]);
-    // 同一汇流箱内组串互为基准：把该汇流箱下全部采集记录的离散率一起回写，保证口径一致
-    await Promise.all(targets.map((item) => putSample({ ...item, discreteRate: rate })));
+    // 先解析整箱读数的有效辐照度（实测 → 同次同箱中位数 → 沿用上条 ≤ 时限 → 缺测退出），
+    // 再只对「计入开关开 + 辐照度有效」的读数归一化后求离散率，剔除/缺测行不参与。
+    const resolved = resolveIrradianceSources(targets, thresholds.irradianceCarryLimitMin ?? 30);
+    const countableValues = targets
+      .filter((item) =>
+        isSampleCountable({
+          excludedFromStats: item.excludedFromStats,
+          irradianceSource: resolved.get(item.id)?.source ?? 'missing',
+        }),
+      )
+      .slice(-40)
+      .map((item) => normalizeCurrent(item.currentA, resolved.get(item.id)?.effective ?? null));
+    const rate = discreteRate(countableValues.length > 0 ? countableValues : [0]);
+    // 同一汇流箱内组串互为基准：把该汇流箱下全部采集记录（含被剔除行）的离散率与
+    // 辐照度解析结果一起回写，保证口径一致、来源可追溯
+    await Promise.all(
+      targets.map((item) => {
+        const resolution = resolved.get(item.id);
+        return putSample({
+          ...item,
+          irradianceSource: resolution?.source ?? item.irradianceSource,
+          effectiveIrradianceWm2: resolution?.effective ?? item.effectiveIrradianceWm2 ?? null,
+          discreteRate: rate,
+        });
+      }),
+    );
     return rate;
   },
 }));

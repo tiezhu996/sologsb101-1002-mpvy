@@ -267,6 +267,16 @@ export default function SettingsView() {
                     <InputNumber min={100} max={1400} step={50} style={{ width: '100%' }} />
                   </Form.Item>
                 </Col>
+                <Col span={12}>
+                  <Form.Item
+                    name="irradianceCarryLimitMin"
+                    label="辐照度沿用时限（分钟）"
+                    rules={[{ required: true, message: '请输入沿用时限' }]}
+                    extra="缺辐照时先取同次同箱中位数，整箱都缺再沿用上一条有效值，超过该时限退出统计"
+                  >
+                    <InputNumber min={1} max={240} step={5} style={{ width: '100%' }} />
+                  </Form.Item>
+                </Col>
               </Row>
               <Space>
                 <Button type="primary" icon={<SaveOutlined />} loading={saving} onClick={() => void save()}>

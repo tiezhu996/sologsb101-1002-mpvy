@@ -32,7 +32,7 @@ import { useDeviceStore } from '../stores/deviceStore';
 import { useDisposalStore } from '../stores/disposalStore';
 import { useCompareGroup, useStringRank } from '../hooks/useStringRank';
 import type { StringDiscreteStat } from '../types/sample';
-import { DISCRETE_LEVEL_LABEL } from '../types/sample';
+import { DISCRETE_LEVEL_LABEL, IRRADIANCE_SOURCE_LABEL } from '../types/sample';
 import { groupKeyOf } from '../utils/discrete';
 import { formatCurrent, formatPercent, share } from '../utils/unit';
 import { shiftDate } from '../utils/format';
@@ -491,6 +491,9 @@ export default function DiagnoseBoard() {
               <Descriptions.Item label="未闭环处置">
                 {openDisposalsOf(target.stringId)} 单
               </Descriptions.Item>
+              <Descriptions.Item label="已剔除读数">
+                {target.excludedCount > 0 ? `${target.excludedCount} 条（不计入统计）` : '无'}
+              </Descriptions.Item>
             </Descriptions>
 
             <Row gutter={14}>
@@ -538,6 +541,7 @@ export default function DiagnoseBoard() {
                       size="small"
                       pagination={false}
                       dataSource={detailSamples}
+                      rowClassName={(row) => (row.excludedFromStats ? 'gb-row-excluded' : '')}
                       columns={[
                         { title: '时间', dataIndex: 'sampledAt', width: 130 },
                         {
@@ -547,13 +551,41 @@ export default function DiagnoseBoard() {
                         },
                         {
                           title: '辐照度',
-                          dataIndex: 'irradianceWm2',
-                          render: (value: number) => `${value} W/m²`,
+                          width: 130,
+                          render: (_, row) => (
+                            <Space size={4}>
+                              <span>
+                                {row.irradianceWm2 !== null && row.irradianceWm2 > 0
+                                  ? `${row.irradianceWm2} W/m²`
+                                  : '缺失'}
+                              </span>
+                              <Tag
+                                color={row.irradianceSource === 'missing' ? 'red' : 'default'}
+                                style={{ marginInlineEnd: 0 }}
+                              >
+                                {IRRADIANCE_SOURCE_LABEL[row.irradianceSource]}
+                              </Tag>
+                            </Space>
+                          ),
                         },
                         {
                           title: '离散率',
                           dataIndex: 'discreteRate',
                           render: (value: number) => `${value.toFixed(2)}%`,
+                        },
+                        {
+                          title: '计入',
+                          width: 70,
+                          render: (_, row) =>
+                            row.excludedFromStats ? (
+                              <Tag color="orange" style={{ marginInlineEnd: 0 }}>
+                                已剔除
+                              </Tag>
+                            ) : (
+                              <Tag color="green" style={{ marginInlineEnd: 0 }}>
+                                计入
+                              </Tag>
+                            ),
                         },
                       ]}
                     />

@@ -19,6 +19,7 @@ import {
   Switch,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
 import { DeleteOutlined, EditOutlined, PlusOutlined, ThunderboltOutlined } from '@ant-design/icons';
@@ -26,6 +27,7 @@ import dayjs from 'dayjs';
 import { useSampleStore } from '../stores/sampleStore';
 import { useDeviceStore } from '../stores/deviceStore';
 import type { SampleDraft, SampleRow as SampleViewRow, StringDiscreteStat } from '../types/sample';
+import { IRRADIANCE_SOURCE_LABEL } from '../types/sample';
 import { normalizeCurrent } from '../utils/discrete';
 import { formatCurrent, formatIrradiance, formatPercent, formatVoltage, share } from '../utils/unit';
 import DiscreteBadge from '../components/common/DiscreteBadge';
@@ -38,7 +40,8 @@ interface SampleFormValues {
   sampledAt: dayjs.Dayjs;
   currentA: number;
   voltageV: number;
-  irradianceWm2: number;
+  /** 可留空：系统按同次同箱中位数 / 沿用上一条有效值补齐 */
+  irradianceWm2: number | null;
 }
 
 interface BatchRow {
@@ -59,6 +62,7 @@ export default function SampleEntry() {
   const addBatchSamples = useSampleStore((state) => state.addBatchSamples);
   const updateSample = useSampleStore((state) => state.updateSample);
   const deleteSample = useSampleStore((state) => state.deleteSample);
+  const setSampleExcluded = useSampleStore((state) => state.setSampleExcluded);
   const toggleMark = useSampleStore((state) => state.toggleMark);
   const markedStringIds = useSampleStore((state) => state.markedStringIds);
 
@@ -120,13 +124,14 @@ export default function SampleEntry() {
         : Number((stats.reduce((sum, stat) => sum + stat.discreteRate, 0) / stats.length).toFixed(2));
     return {
       samples: samples.length,
+      excluded: samples.filter((item) => item.excludedFromStats).length,
       strings: stats.length,
       mismatch,
       watch,
       avgRate,
       mismatchShare: share(mismatch, stats.length),
     };
-  }, [stats, samples.length]);
+  }, [stats, samples]);
 
   /** 汇流箱候选（用于批量录入） */
   const boxOptions = useMemo(() => {
@@ -163,7 +168,7 @@ export default function SampleEntry() {
       sampledAt: values.sampledAt.format('YYYY-MM-DD HH:mm'),
       currentA: values.currentA,
       voltageV: values.voltageV,
-      irradianceWm2: values.irradianceWm2,
+      irradianceWm2: values.irradianceWm2 ?? null,
     };
     if (modal.editing) {
       await updateSample(modal.editing.id, draft);
@@ -254,7 +259,13 @@ export default function SampleEntry() {
       </div>
 
       <div className="gb-stat-grid">
-        <StatBadge title="采集记录" value={totals.samples} suffix="条" color="#1668dc" />
+        <StatBadge
+          title="采集记录"
+          value={totals.samples}
+          suffix="条"
+          color="#1668dc"
+          hint={totals.excluded > 0 ? `已剔除 ${totals.excluded} 条（保留可查，不计入统计）` : '全部计入统计'}
+        />
         <StatBadge title="已采集组串" value={totals.strings} suffix="串" color="#0f7b6c" />
         <StatBadge
           title="平均离散率"
@@ -327,7 +338,8 @@ export default function SampleEntry() {
                 size="small"
                 dataSource={filtered}
                 pagination={{ pageSize: 10, size: 'small' }}
-                scroll={{ x: 1180 }}
+                scroll={{ x: 1380 }}
+                rowClassName={(row) => (row.excludedFromStats ? 'gb-row-excluded' : '')}
                 columns={[
                   { title: '采集时间', dataIndex: 'sampledAt', width: 140 },
                   {
@@ -345,9 +357,36 @@ export default function SampleEntry() {
                   },
                   {
                     title: '辐照度',
-                    dataIndex: 'irradianceWm2',
-                    width: 110,
-                    render: (value: number) => formatIrradiance(value),
+                    width: 150,
+                    render: (_, row) => (
+                      <Space size={4}>
+                        <span>
+                          {row.irradianceWm2 !== null && row.irradianceWm2 > 0
+                            ? formatIrradiance(row.irradianceWm2)
+                            : '缺失'}
+                        </span>
+                        <Tooltip
+                          title={
+                            row.irradianceSource === 'missing'
+                              ? `整箱缺测且上一条有效值超过 ${thresholds.irradianceCarryLimitMin} 分钟，该读数退出统计`
+                              : `归一化采用 ${row.effectiveIrradianceWm2 ?? '-'} W/m²（${IRRADIANCE_SOURCE_LABEL[row.irradianceSource]}）`
+                          }
+                        >
+                          <Tag
+                            color={
+                              row.irradianceSource === 'measured'
+                                ? 'default'
+                                : row.irradianceSource === 'missing'
+                                  ? 'red'
+                                  : 'blue'
+                            }
+                            style={{ marginInlineEnd: 0 }}
+                          >
+                            {IRRADIANCE_SOURCE_LABEL[row.irradianceSource]}
+                          </Tag>
+                        </Tooltip>
+                      </Space>
+                    ),
                   },
                   {
                     title: '归一化电流',
@@ -376,6 +415,32 @@ export default function SampleEntry() {
                         />
                       );
                     },
+                  },
+                  {
+                    title: '计入统计',
+                    width: 95,
+                    render: (_, row) => (
+                      <Tooltip
+                        title={
+                          row.excludedFromStats
+                            ? '已剔除（如云影影响），原始读数保留；点击重新计入'
+                            : '参与离散率与失配统计；点击剔除（不删记录）'
+                        }
+                      >
+                        <Switch
+                          size="small"
+                          checked={!row.excludedFromStats}
+                          onChange={async (checked) => {
+                            await setSampleExcluded(row.id, !checked);
+                            message.success(
+                              checked
+                                ? '已重新计入统计，离散率榜与失配数已重算'
+                                : '已剔除：原始读数保留可查，离散率榜与失配数已按剩余读数重算',
+                            );
+                          }}
+                        />
+                      </Tooltip>
+                    ),
                   },
                   {
                     title: '标记',
@@ -457,6 +522,7 @@ export default function SampleEntry() {
             <Typography.Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0 }}>
               归一化基准辐照度 {thresholds.standardIrradiance} W/m²；电流偏差 ≥{' '}
               {thresholds.currentBiasPercent}% 判可疑；最少采集点数 {thresholds.minSampleCount}。
+              榜单与失配数只统计「计入统计」开关开启且辐照度有效的读数，被剔除读数保留原始记录可随时恢复。
             </Typography.Paragraph>
           </Card>
         </Col>
@@ -500,16 +566,22 @@ export default function SampleEntry() {
           <Form.Item name="voltageV" label="电压（V）" rules={[{ required: true, message: '请输入电压' }]}>
             <InputNumber min={0} max={2000} step={0.1} style={{ width: '100%' }} />
           </Form.Item>
-          <Form.Item name="irradianceWm2" label="辐照度（W/m²）" rules={[{ required: true, message: '请输入辐照度' }]}>
-            <InputNumber min={0} max={1400} step={10} style={{ width: '100%' }} />
+          <Form.Item
+            name="irradianceWm2"
+            label="辐照度（W/m²）"
+            extra={`可留空：优先取同次同汇流箱其他组串中位数，整箱都缺则沿用上一条有效值（≤ ${thresholds.irradianceCarryLimitMin} 分钟），超出后该读数退出统计`}
+          >
+            <InputNumber min={0} max={1400} step={10} style={{ width: '100%' }} placeholder="缺测可留空" />
           </Form.Item>
           <Form.Item noStyle shouldUpdate>
             {() => {
               const current = Number(form.getFieldValue('currentA') ?? 0);
-              const irradiance = Number(form.getFieldValue('irradianceWm2') ?? 0);
+              const irradiance = form.getFieldValue('irradianceWm2') as number | null;
               return (
                 <Typography.Paragraph type="secondary">
-                  归一化电流预览：{formatCurrent(normalizeCurrent(current, irradiance, thresholds))}
+                  {irradiance !== null && irradiance !== undefined && irradiance > 0
+                    ? `归一化电流预览：${formatCurrent(normalizeCurrent(current, irradiance, thresholds))}`
+                    : '辐照度缺测：归一化将使用补齐后的有效辐照度（同箱中位 / 沿用上条）'}
                 </Typography.Paragraph>
               );
             }}

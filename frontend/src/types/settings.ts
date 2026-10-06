@@ -10,6 +10,8 @@ export interface ThresholdConfig {
   minSampleCount: number;
   /** 标准辐照度（W/m²），用于电流归一化 */
   standardIrradiance: number;
+  /** 辐照度沿用时限（分钟）：缺辐照时沿用上一条有效值的最大时间差，超出则退出统计 */
+  irradianceCarryLimitMin: number;
 }
 
 /** 默认阈值 */
@@ -19,6 +21,7 @@ export const DEFAULT_THRESHOLDS: ThresholdConfig = {
   currentBiasPercent: 8,
   minSampleCount: 3,
   standardIrradiance: 1000,
+  irradianceCarryLimitMin: 30,
 };
 
 /** 阈值在 IndexedDB 中的存储行 */
@@ -37,6 +40,7 @@ export function validateThresholds(config: ThresholdConfig): string[] {
   if (config.currentBiasPercent <= 0) errors.push('电流偏差阈值必须大于 0');
   if (config.minSampleCount < 1) errors.push('最少采集点数至少为 1');
   if (config.standardIrradiance <= 0) errors.push('标准辐照度必须大于 0');
+  if (config.irradianceCarryLimitMin < 1) errors.push('辐照度沿用时限至少为 1 分钟');
   return errors;
 }
 

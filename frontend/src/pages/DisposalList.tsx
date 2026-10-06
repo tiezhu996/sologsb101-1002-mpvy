@@ -21,6 +21,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
 import {
@@ -322,10 +323,26 @@ export default function DisposalList() {
               {
                 title: '派单离散率',
                 dataIndex: 'initialDiscreteRate',
-                width: 130,
-                render: (value: number) => (
-                  <DiscreteBadge rate={value} thresholds={thresholds} size="small" />
-                ),
+                width: 200,
+                render: (value: number, row) => {
+                  // 派单值落库后不再改动；读数剔除/恢复或辐照度重解析导致当前值偏离时提示依据变化
+                  const current = stats.find((item) => item.stringId === row.stringId)?.discreteRate;
+                  const changed = typeof current === 'number' && Math.abs(current - value) >= 0.01;
+                  return (
+                    <Space size={4}>
+                      <DiscreteBadge rate={value} thresholds={thresholds} size="small" />
+                      {changed ? (
+                        <Tooltip
+                          title={`派单后统计依据已变化（读数剔除/重新计入或辐照度来源重解析），当前重算离散率 ${current.toFixed(2)}%；派单值保留不改`}
+                        >
+                          <Tag color="orange" style={{ marginInlineEnd: 0 }}>
+                            依据已变化
+                          </Tag>
+                        </Tooltip>
+                      ) : null}
+                    </Space>
+                  );
+                },
               },
               { title: '责任人', dataIndex: 'owner', width: 100 },
               { title: '要求完成', dataIndex: 'dueDate', width: 120 },
