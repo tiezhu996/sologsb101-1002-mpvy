@@ -199,6 +199,9 @@ export const useDisposalStore = create<DisposalStoreState>((set, get) => ({
         plantName: plant?.name ?? '未归属电站',
         cleared: isCleared(disposal.retestCurrentA, baseline),
         overdue: isOverdue(disposal),
+        // store 层无采样榜单上下文：依据变化由处置单页结合重算离散率派生，这里给安全默认值
+        currentDiscreteRate: null,
+        basisChanged: false,
       };
     });
   },

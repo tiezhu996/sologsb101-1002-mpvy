@@ -4,8 +4,23 @@
  * 纯函数，供采集页、排查工作台与处置单页共用。
  */
 import { DEFAULT_THRESHOLDS, type ThresholdConfig } from '../types/settings';
-import type { DiscreteLevel, Sample, StringDiscreteStat } from '../types/sample';
+import type {
+  DiscreteLevel,
+  IrradianceValue,
+  Sample,
+  StringDiscreteStat,
+} from '../types/sample';
 import { round } from './format';
+
+/** 参与聚合的采集读数：携带补全后的辐照度与统计口径标记 */
+export interface StatSample extends Sample {
+  /** 实际用于归一化的辐照度（同箱中位数 / 上一条有效值补全） */
+  effectiveIrradianceWm2: number;
+  /** 是否计入统计（人工剔除或补全值过期时为 false） */
+  countedInStats: boolean;
+  /** 不计入统计的原因（剔除原因 / 补全过期） */
+  uncountedReason: string | null;
+}
 
 /** 均值 */
 export function mean(values: number[]): number {
@@ -31,10 +46,10 @@ export function discreteRate(values: number[]): number {
 /** 电流归一化修正：把实测电流折算到标准辐照度下，消除云影/时段影响 */
 export function normalizeCurrent(
   currentA: number,
-  irradianceWm2: number,
+  irradianceWm2: IrradianceValue,
   config: ThresholdConfig = DEFAULT_THRESHOLDS,
 ): number {
-  if (irradianceWm2 <= 0) return round(currentA, 3);
+  if (irradianceWm2 === null || irradianceWm2 <= 0) return round(currentA, 3);
   const ratio = config.standardIrradiance / irradianceWm2;
   // 辐照度极低时归一化会放大噪声，限制修正倍数上限为 2
   return round(currentA * Math.min(ratio, 2), 3);
@@ -69,12 +84,14 @@ export function groupKeyOf(row: { inverterId: string; combinerBox: string }): st
 /**
  * 由采集记录聚合出组串离散率榜。
  * 同一汇流箱内的组串电流互为基准，逐组串计算离散率与电流偏差。
+ * 仅 countedInStats 的读数参与计算；无任何有效读数的组串退出统计（不出现在榜单中），
+ * 原始记录仍保留在采集表内，可随时恢复。
  */
 export function buildStringStats(
-  samples: Sample[],
+  samples: StatSample[],
   config: ThresholdConfig = DEFAULT_THRESHOLDS,
 ): StringDiscreteStat[] {
-  const grouped = new Map<string, Sample[]>();
+  const grouped = new Map<string, StatSample[]>();
   for (const sample of samples) {
     const list = grouped.get(sample.stringId);
     if (list) list.push(sample);
@@ -86,19 +103,32 @@ export function buildStringStats(
     values: number[];
     raws: number[];
     lastSampledAt: string;
+    /** 参与统计的读数条数 */
     count: number;
+    /** 原始记录总数（含剔除 / 过期） */
+    totalCount: number;
+    /** 人工剔除条数 */
+    excludedCount: number;
+    /** 补全辐照度过期而退出统计的条数 */
+    staleCount: number;
   }
 
   const drafts: Draft[] = [];
   for (const [stringId, list] of grouped) {
-    const sorted = [...list].sort((a, b) => a.sampledAt.localeCompare(b.sampledAt));
-    const window = sorted.slice(-8);
+    const sortedAll = [...list].sort((a, b) => a.sampledAt.localeCompare(b.sampledAt));
+    const counted = sortedAll.filter((item) => item.countedInStats);
+    // 无一条读数可计入统计：整串退出榜单，避免错误来源误报失配
+    if (counted.length === 0) continue;
+    const window = counted.slice(-8);
     drafts.push({
       stringId,
-      values: window.map((item) => normalizeCurrent(item.currentA, item.irradianceWm2, config)),
+      values: window.map((item) => normalizeCurrent(item.currentA, item.effectiveIrradianceWm2, config)),
       raws: window.map((item) => item.currentA),
-      lastSampledAt: sorted[sorted.length - 1]?.sampledAt ?? '',
-      count: list.length,
+      lastSampledAt: sortedAll[sortedAll.length - 1]?.sampledAt ?? '',
+      count: counted.length,
+      totalCount: sortedAll.length,
+      excludedCount: sortedAll.filter((item) => item.excludedFromStats).length,
+      staleCount: sortedAll.filter((item) => !item.countedInStats && !item.excludedFromStats).length,
     });
   }
 
@@ -109,7 +139,10 @@ export function buildStringStats(
     inverterId: '',
     arrayId: '',
     plantId: '',
+    totalSampleCount: draft.totalCount,
     sampleCount: draft.count,
+    excludedCount: draft.excludedCount,
+    staleCount: draft.staleCount,
     avgCurrentA: round(mean(draft.raws), 2),
     avgNormalizedCurrentA: round(mean(draft.values), 3),
     discreteRate: discreteRate(draft.values),
@@ -118,15 +151,7 @@ export function buildStringStats(
     lastSampledAt: draft.lastSampledAt,
   }));
 
-  // 逐集合（汇流箱）计算相对偏差与最终档位
-  const buckets = new Map<string, StringDiscreteStat[]>();
-  for (const stat of stats) {
-    const key = stat.inverterId ? groupKeyOf(stat) : stat.stringId.slice(0, 0) + '__pending';
-    const list = buckets.get(key);
-    if (list) list.push(stat);
-    else buckets.set(key, [stat]);
-  }
-
+  // 逐集合（汇流箱）计算相对偏差与最终档位（上下文由调用方补齐前按全局口径兜底）
   const globalBaseline = mean(stats.map((item) => item.avgNormalizedCurrentA));
   for (const stat of stats) {
     const baseline = globalBaseline > 0 ? globalBaseline : stat.avgNormalizedCurrentA;

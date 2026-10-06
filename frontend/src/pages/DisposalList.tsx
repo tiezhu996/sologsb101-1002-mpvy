@@ -6,6 +6,7 @@
 import { useMemo, useState } from 'react';
 import {
   App as AntdApp,
+  Alert,
   Button,
   Card,
   Col,
@@ -21,6 +22,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
 import {
@@ -29,6 +31,7 @@ import {
   ExclamationCircleOutlined,
   PlusOutlined,
   SendOutlined,
+  WarningOutlined,
 } from '@ant-design/icons';
 import dayjs from 'dayjs';
 import { useDisposalStore } from '../stores/disposalStore';
@@ -37,6 +40,7 @@ import { useSampleStore } from '../stores/sampleStore';
 import {
   DISPOSAL_STATE_LABEL,
   DISPOSAL_TYPE_LABEL,
+  isBasisChanged,
   isCleared,
   isOverdue,
   type DisposalDraft,
@@ -74,7 +78,7 @@ export default function DisposalList() {
   const stats = useSampleStore((state) => state.stats);
   const thresholds = useSampleStore((state) => state.thresholds);
 
-  /** 处置单视图行：拼接组串上下文并判定消缺 / 逾期（派生自 store 明细，保持响应式） */
+  /** 处置单视图行：拼接组串上下文并判定消缺 / 逾期 / 依据变化（派生自 store 明细，保持响应式） */
   const rows: DisposalViewRow[] = useMemo(
     () =>
       disposals.map((disposal) => {
@@ -83,6 +87,9 @@ export default function DisposalList() {
         const array = inverter ? arrays.find((item) => item.id === inverter.arrayId) : undefined;
         const plant = array ? plants.find((item) => item.id === array.plantId) : undefined;
         const baseline = string ? (baselines[`${string.inverterId}::${string.combinerBox}`] ?? 9.4) : 9.4;
+        // 派单离散率保留不改；当前值来自剔除/恢复后按剩余读数重算的榜单，整串退出统计则为 null
+        const stat = stats.find((item) => item.stringId === disposal.stringId);
+        const currentDiscreteRate = stat ? stat.discreteRate : null;
         return {
           ...disposal,
           stringCode: string?.code ?? '已删除组串',
@@ -93,9 +100,15 @@ export default function DisposalList() {
           plantName: plant?.name ?? '未归属电站',
           cleared: isCleared(disposal.retestCurrentA, baseline),
           overdue: isOverdue(disposal),
+          currentDiscreteRate,
+          basisChanged: isBasisChanged({
+            initialDiscreteRate: disposal.initialDiscreteRate,
+            currentDiscreteRate,
+            alarmRate: thresholds.discreteAlarmRate,
+          }),
         };
       }),
-    [disposals, strings, inverters, arrays, plants, baselines],
+    [disposals, strings, inverters, arrays, plants, baselines, stats, thresholds.discreteAlarmRate],
   );
 
   const [form] = Form.useForm<Omit<DisposalDraft, 'dueDate'> & { dueDate: dayjs.Dayjs }>();
@@ -271,6 +284,17 @@ export default function DisposalList() {
         />
       </div>
 
+      {rows.some((row) => row.basisChanged) ? (
+        <Alert
+          type="warning"
+          showIcon
+          icon={<WarningOutlined />}
+          style={{ marginBottom: 12 }}
+          message={`${rows.filter((row) => row.basisChanged).length} 张处置单的派单依据已变化（读数剔除 / 恢复后按剩余读数重算）`}
+          description="派单离散率保留登记值不改，请结合当前重算值复核是否继续处置或撤单；重新计入的读数会再次自动重算并刷新提示。"
+        />
+      ) : null}
+
       <Card size="small" styles={{ body: { padding: 12 } }}>
         {filtered.length === 0 ? (
           <EmptyPanel
@@ -285,7 +309,7 @@ export default function DisposalList() {
             size="small"
             dataSource={filtered}
             pagination={{ pageSize: 10, size: 'small' }}
-            scroll={{ x: 1180 }}
+            scroll={{ x: 1260 }}
             columns={[
               {
                 title: '类型',
@@ -322,9 +346,26 @@ export default function DisposalList() {
               {
                 title: '派单离散率',
                 dataIndex: 'initialDiscreteRate',
-                width: 130,
-                render: (value: number) => (
-                  <DiscreteBadge rate={value} thresholds={thresholds} size="small" />
+                width: 175,
+                render: (value: number, row) => (
+                  <Space size={4}>
+                    <DiscreteBadge rate={value} thresholds={thresholds} size="small" />
+                    {row.basisChanged ? (
+                      <Tooltip
+                        title={
+                          row.currentDiscreteRate === null
+                            ? `派单时 ${value.toFixed(2)}%；该串读数已全部退出统计（剔除或补全辐照度过期），请复核是否继续处置，派单值保留不改`
+                            : `派单时 ${value.toFixed(2)}% → 按剩余读数重算 ${row.currentDiscreteRate.toFixed(
+                                2,
+                              )}%，派单依据已变化，请复核；派单值保留不改`
+                        }
+                      >
+                        <Tag color="warning" icon={<WarningOutlined />} style={{ marginInlineEnd: 0 }}>
+                          依据变化
+                        </Tag>
+                      </Tooltip>
+                    ) : null}
+                  </Space>
                 ),
               },
               { title: '责任人', dataIndex: 'owner', width: 100 },

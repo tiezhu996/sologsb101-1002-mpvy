@@ -26,8 +26,10 @@ docker compose up -d --build # 代码改动后重建
 - 录入电站与方阵结构（装机容量、并网日期、纬度、倾角、方位角）
 - 维护逆变器 / 汇流箱 / 组串三级设备台账，支持批量新增组串
 - 采集组串电流、电压、辐照度，按汇流箱分组实时计算**离散率**（标准差 / 均值），辐照度不同自动做归一化修正
+- 云影复核：受影响读数可一键**「不计入统计」但保留原始记录**，原始读数随时可查看，离散率榜与失配数按剩余读数重算，恢复计入同样自动重算
+- 辐照度缺失补全：优先取**同次同汇流箱其他组串实测中位数**，整箱都缺再沿用**本组串上一条有效值**；沿用间隔超过 **30 分钟**的读数退出统计（记录保留），避免来源选错误报失配
 - 在失配排查工作台按离散率与电流偏差排序、人工标记可疑组串、追溯同汇流箱与同逆变器对比
-- 下发处置单并回填复测电流，复测达基准 95% 自动判定消缺
+- 下发处置单并回填复测电流，复测达基准 95% 自动判定消缺；读数剔除 / 恢复导致依据变化时，**已有处置单保留派单值**并给出「依据变化」提示
 - 配置判定阈值、查看 IndexedDB 结构版本并做整库 JSON 导出 / 导入
 
 本项目为**纯前端单页应用**：无后端、无数据库服务、无外部接口，全部数据保存在浏览器 IndexedDB。
@@ -82,13 +84,16 @@ sologsb101-1002/
         ├── pages/               # PlantList.tsx DeviceLedger.tsx SampleEntry.tsx DiagnoseBoard.tsx DisposalList.tsx SettingsView.tsx
         ├── router/index.tsx     # 路由表（懒加载页面 + App 布局）
         ├── router/routes.ts     # 叶子模块：仅路径常量，切断 App ⇄ router 循环依赖
-        └── utils/               # discrete.ts unit.ts db.ts export.ts events.ts format.ts
+        └── utils/               # discrete.ts unit.ts db.ts export.ts events.ts format.ts irradiance.ts
 ```
 
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbpvstring`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记了 v1 → v2 的 `upgrade` 迁移（补齐行修订号 `revision`、迁移旧字段 `combinerNo → combinerBox`、写入默认阈值）。
+- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`：
+  - v1：基础索引初版；
+  - v2：补齐行修订号 `revision`、迁移旧字段 `combinerNo → combinerBox`、写入默认阈值；
+  - v3：采集读数新增 `excludedFromStats` / `excludeReason`（剔除统计但保留原始记录，默认参与），`irradianceWm2` 允许为 `null`（缺失时按「同箱中位数 → 上一条有效值」补全，超 30 分钟退出统计），samples 表新增 `excludedFromStats` 索引；旧库打开时自动迁移，历史读数默认计入、非正辐照度归一为 null。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -97,7 +102,7 @@ sologsb101-1002/
   | `arrays` | 方阵 | id / plantId / code / capacityKw |
   | `inverters` | 逆变器 | id / arrayId / model / ratedKw |
   | `strings` | 组串 | id / inverterId / combinerBox / code / moduleModel |
-  | `samples` | 采集读数 | id / stringId / sampledAt / [stringId+sampledAt] |
+  | `samples` | 采集读数 | id / stringId / sampledAt / excludedFromStats / [stringId+sampledAt] |
   | `disposals` | 处置单 | id / stringId / state / type / owner / dueDate |
   | `settings` | 阈值配置 | id（固定 `threshold`） |
 

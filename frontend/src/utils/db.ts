@@ -14,14 +14,15 @@ import type { Sample } from '../types/sample';
 import type { Disposal } from '../types/disposal';
 import { DEFAULT_THRESHOLDS, type ThresholdRow } from '../types/settings';
 import { ROW_REVISION, type Revisioned } from '../types/persistence';
-import { normalizeCurrent, discreteRate } from './discrete';
+import { buildStringStats, type StatSample } from './discrete';
+import { resolveIrradianceBatch, type IrradianceOwner } from './irradiance';
 import { nowIso, round, shiftDate, todayDate, uuid } from './format';
 
 /** 数据库名（浏览器 IndexedDB 库名） */
 export const DB_NAME = 'gbpvstring';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -95,6 +96,30 @@ class PvStringDatabase extends Dexie {
         if (!existing) {
           await settings.put({ ...DEFAULT_THRESHOLDS, id: 'threshold', updatedAt: nowIso() });
         }
+      });
+
+    // v3：采集读数支持「剔除统计但保留记录」（excludedFromStats / excludeReason），
+    //     辐照度允许缺失（null，按同箱中位数 → 上一条有效值补全，超 30 分钟退出统计）
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        plants: 'id, name, gridDate, latitude, capacityMWp',
+        arrays: 'id, plantId, code, capacityKw',
+        inverters: 'id, arrayId, model, ratedKw',
+        strings: 'id, inverterId, combinerBox, code, moduleModel',
+        samples: 'id, stringId, sampledAt, excludedFromStats, [stringId+sampledAt]',
+        disposals: 'id, stringId, state, type, owner, dueDate',
+        settings: 'id',
+      })
+      .upgrade(async (tx) => {
+        await tx.table('samples').toCollection().modify((row: Record<string, unknown>) => {
+          // 历史读数默认参与统计；辐照度字段非正数归一为 null（缺失）
+          row.revision = ROW_REVISION;
+          if (typeof row.excludedFromStats !== 'boolean') row.excludedFromStats = false;
+          if (typeof row.excludeReason !== 'string') row.excludeReason = null;
+          if (typeof row.irradianceWm2 !== 'number' || !Number.isFinite(row.irradianceWm2) || row.irradianceWm2 <= 0) {
+            row.irradianceWm2 = null;
+          }
+        });
       });
   }
 }
@@ -316,39 +341,122 @@ async function seedDatabase(): Promise<void> {
                 voltageV: round(boxPlan.seriesCount * 41.6 + random() * 22, 1),
                 irradianceWm2: irradiance,
                 discreteRate: 0,
+                excludedFromStats: false,
+                excludeReason: null,
                 createdAt: stamp,
                 revision: ROW_REVISION,
               });
             }
           }
         });
+
+        // 复核场景演示（取该逆变器第一个汇流箱的前 3 串）：
+        // ① 云影读数：被人工剔除但保留原始记录，可随时恢复计入
+        // ② 辐照度缺失：同次同箱其他组串有实测值 → 中位数补全，正常统计
+        // ③ 辐照度缺失且整箱都缺：沿用上一条实测值，间隔 40 分钟 → 超 30 分钟退出统计
+        const demoBox = inverterPlan.boxes[0];
+        if (demoBox) {
+          const demoSeq = demoBox.startSeq;
+          const demoStringId = `str-${inverterId}-${demoSeq}`;
+          const nextStringId =
+            demoBox.count > 1 ? `str-${inverterId}-${demoSeq + 1}` : demoStringId;
+          const thirdStringId =
+            demoBox.count > 2 ? `str-${inverterId}-${demoSeq + 2}` : nextStringId;
+          const demoDay = shiftDate(-1);
+          // 云影遮挡：电流被压低，原始读数保留但默认已剔除
+          samples.push({
+            id: `smp-${demoStringId}-cloud`,
+            stringId: demoStringId,
+            sampledAt: `${demoDay} 11:05`,
+            currentA: 3.12,
+            voltageV: round(demoBox.seriesCount * 41.2, 1),
+            irradianceWm2: 812,
+            discreteRate: 0,
+            excludedFromStats: true,
+            excludeReason: '云影复核剔除：电流骤降与云图记录一致',
+            createdAt: stamp,
+            revision: ROW_REVISION,
+          });
+          // 同次采集中本串辐照度缺失，由同箱其他组串实测中位数补全
+          samples.push({
+            id: `smp-${nextStringId}-peer`,
+            stringId: nextStringId,
+            sampledAt: `${demoDay} 11:05`,
+            currentA: round(8.6 + random() * 0.4, 2),
+            voltageV: round(demoBox.seriesCount * 41.6, 1),
+            irradianceWm2: null,
+            discreteRate: 0,
+            excludedFromStats: false,
+            excludeReason: null,
+            createdAt: stamp,
+            revision: ROW_REVISION,
+          });
+          // ③a 本组串上一条实测辐照度（40 分钟前，同箱其他组串该时刻亦无上报）
+          samples.push({
+            id: `smp-${thirdStringId}-lastmeasured`,
+            stringId: thirdStringId,
+            sampledAt: `${demoDay} 11:20`,
+            currentA: round(8.4 + random() * 0.4, 2),
+            voltageV: round(demoBox.seriesCount * 41.6, 1),
+            irradianceWm2: 868,
+            discreteRate: 0,
+            excludedFromStats: false,
+            excludeReason: null,
+            createdAt: stamp,
+            revision: ROW_REVISION,
+          });
+          // ③b 整箱都缺辐照度：仅本串有 40 分钟前的实测值可沿用 → 过期退出统计
+          samples.push({
+            id: `smp-${thirdStringId}-stale`,
+            stringId: thirdStringId,
+            sampledAt: `${demoDay} 12:00`,
+            currentA: round(8.4 + random() * 0.4, 2),
+            voltageV: round(demoBox.seriesCount * 41.6, 1),
+            irradianceWm2: null,
+            discreteRate: 0,
+            excludedFromStats: false,
+            excludeReason: null,
+            createdAt: stamp,
+            revision: ROW_REVISION,
+          });
+        }
       });
     });
   });
 
-  // 采集离散率落库：按逆变器+汇流箱分组计算，写入每条采集记录
-  const byBucket = new Map<string, SampleRow[]>();
-  for (const sample of samples) {
-    const owner = strings.find((item) => item.id === sample.stringId);
-    if (!owner) continue;
-    const key = `${owner.inverterId}::${owner.combinerBox}`;
-    const list = byBucket.get(key);
-    if (list) list.push(sample);
-    else byBucket.set(key, [sample]);
+  // 采集离散率落库：与榜单口径一致——先补全缺失辐照度（同箱中位数 → 上一条有效值，
+  // 超 30 分钟退出统计），再按组串基于「计入统计」的读数计算；剔除/过期读数落 0
+  const owners = new Map<string, IrradianceOwner>();
+  for (const owner of strings) {
+    owners.set(owner.id, {
+      stringId: owner.id,
+      inverterId: owner.inverterId,
+      combinerBox: owner.combinerBox,
+    });
   }
-  for (const list of byBucket.values()) {
-    const byString = new Map<string, SampleRow[]>();
-    for (const sample of list) {
-      const rows = byString.get(sample.stringId);
-      if (rows) rows.push(sample);
-      else byString.set(sample.stringId, [sample]);
-    }
-    for (const rows of byString.values()) {
-      const rate = discreteRate(
-        rows.map((row) => normalizeCurrent(row.currentA, row.irradianceWm2)),
-      );
-      for (const row of rows) row.discreteRate = rate;
-    }
+  const resolved = resolveIrradianceBatch(samples, owners);
+  const statSamples: StatSample[] = samples.map((sample) => {
+    const info = resolved.get(sample.id);
+    const counted =
+      !sample.excludedFromStats && info !== undefined && info.fresh && info.source !== 'none';
+    return {
+      ...sample,
+      effectiveIrradianceWm2: info?.effectiveIrradianceWm2 ?? 0,
+      countedInStats: counted,
+      uncountedReason: sample.excludedFromStats
+        ? sample.excludeReason ?? '人工剔除'
+        : info && !info.fresh
+          ? '补全辐照度距采集已超过 30 分钟'
+          : null,
+    };
+  });
+  const seededStats = buildStringStats(statSamples, DEFAULT_THRESHOLDS);
+  const rateByString = new Map<string, number>(seededStats.map((stat) => [stat.stringId, stat.discreteRate]));
+  for (const row of statSamples) {
+    row.discreteRate = row.countedInStats ? (rateByString.get(row.stringId) ?? 0) : 0;
+    // 同步回写 samples 中的同 id 记录
+    const target = samples.find((item) => item.id === row.id);
+    if (target) target.discreteRate = row.discreteRate;
   }
 
   // 处置单：为离散率最高的前 5 个组串建单，状态各不相同
@@ -359,7 +467,7 @@ async function seedDatabase(): Promise<void> {
   const ranked = [...perString.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
   const types: Array<Disposal['type']> = ['clean', 'replace', 'retest', 'clean', 'replace'];
   const states: Array<Disposal['state']> = ['pending', 'assigned', 'retested', 'assigned', 'pending'];
-  const owners = ['李文波', '张启明', '王慧敏'];
+  const ownerNames = ['李文波', '张启明', '王慧敏'];
   ranked.forEach(([stringId, rate], index) => {
     const state = states[index % states.length];
     disposals.push({
@@ -367,7 +475,7 @@ async function seedDatabase(): Promise<void> {
       stringId,
       type: types[index % types.length],
       state,
-      owner: owners[index % owners.length],
+      owner: ownerNames[index % ownerNames.length],
       dueDate: shiftDate(index % 2 === 0 ? 3 : -2),
       retestCurrentA: state === 'retested' ? round(9.1 + index * 0.18, 2) : null,
       initialDiscreteRate: rate,
@@ -634,6 +742,18 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
   const rev = <T,>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION });
+  // 采集读数兜底：旧版备份可能缺剔除开关，辐照度非正数按缺失处理，原始记录一律保留
+  const revSample = (row: Sample): SampleRow => ({
+    ...row,
+    irradianceWm2:
+      typeof row.irradianceWm2 === 'number' && Number.isFinite(row.irradianceWm2) && row.irradianceWm2 > 0
+        ? row.irradianceWm2
+        : null,
+    excludedFromStats: row.excludedFromStats === true,
+    excludeReason: typeof row.excludeReason === 'string' ? row.excludeReason : null,
+    discreteRate: typeof row.discreteRate === 'number' ? row.discreteRate : 0,
+    revision: ROW_REVISION,
+  });
   await db.transaction(
     'rw',
     [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings],
@@ -650,7 +770,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
       await db.arrays.bulkPut((snapshot.arrays ?? []).map(rev));
       await db.inverters.bulkPut((snapshot.inverters ?? []).map(rev));
       await db.strings.bulkPut((snapshot.strings ?? []).map(rev));
-      await db.samples.bulkPut((snapshot.samples ?? []).map(rev));
+      await db.samples.bulkPut((snapshot.samples ?? []).map(revSample));
       await db.disposals.bulkPut((snapshot.disposals ?? []).map(rev));
       if (snapshot.thresholds) await db.settings.put(snapshot.thresholds);
     },

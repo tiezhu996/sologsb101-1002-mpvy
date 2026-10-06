@@ -67,6 +67,10 @@ export interface DisposalRow extends Disposal, Revisioned {
   cleared: boolean | null;
   /** 是否逾期（未复测且 dueDate 早于今天） */
   overdue: boolean;
+  /** 依据剩余读数重算后的当前离散率（%）；整串读数全退出统计时为 null */
+  currentDiscreteRate: number | null;
+  /** 派单依据是否已变化（剔除/恢复读数导致离散率或失配判定改变），派单值本身保留不改 */
+  basisChanged: boolean;
 }
 
 /** 复测消缺判定阈值：复测电流达到基准电流的 95% 即消缺 */
@@ -91,4 +95,25 @@ export function completionRate(disposals: Disposal[]): number {
   if (disposals.length === 0) return 0;
   const done = disposals.filter((item) => item.state === 'retested').length;
   return Number(((done / disposals.length) * 100).toFixed(1));
+}
+
+/**
+ * 派单依据是否已变化：读数被剔除/恢复后离散率按剩余读数重算，已有处置单保留派单值，
+ * 仅提示依据变化（差值 ≥ 1 个百分点 或 跨越失配阈值），供运维员复核是否继续处置。
+ */
+export const BASIS_RATE_DELTA = 1;
+
+export function isBasisChanged(input: {
+  initialDiscreteRate: number;
+  currentDiscreteRate: number | null;
+  alarmRate: number;
+}): boolean {
+  const { initialDiscreteRate, currentDiscreteRate, alarmRate } = input;
+  // 整串读数全部退出统计：榜单中已无该串，同样属于依据变化
+  if (currentDiscreteRate === null) return true;
+  if (Math.abs(currentDiscreteRate - initialDiscreteRate) >= BASIS_RATE_DELTA) return true;
+  const crossed =
+    (initialDiscreteRate >= alarmRate && currentDiscreteRate < alarmRate) ||
+    (initialDiscreteRate < alarmRate && currentDiscreteRate >= alarmRate);
+  return crossed;
 }

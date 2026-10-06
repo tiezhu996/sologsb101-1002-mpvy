@@ -35,8 +35,9 @@ export function formatPercent(value: number, digits = 2, withSign = false): stri
   return `${sign}${value.toFixed(digits)}%`;
 }
 
-/** 辐照度展示 */
-export function formatIrradiance(value: number): string {
+/** 辐照度展示（缺失时显示「未上报」） */
+export function formatIrradiance(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '未上报';
   return `${value.toFixed(0)} W/m²`;
 }
 

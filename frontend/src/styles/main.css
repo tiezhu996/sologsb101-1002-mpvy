@@ -121,6 +121,16 @@ body::before {
   background: #fffbe6;
 }
 
+/* 被剔除 / 退出统计的采集读数：原始记录保留，仅置灰提示 */
+.gb-sample-row.is-excluded > td {
+  background: #fafafa !important;
+  color: rgba(0, 0, 0, 0.45);
+}
+
+.gb-sample-row.is-excluded:hover > td {
+  background: #f0f0f0 !important;
+}
+
 .gb-scroll {
   max-height: 420px;
   overflow: auto;

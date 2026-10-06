@@ -11,7 +11,9 @@ import {
   DatePicker,
   Drawer,
   Form,
+  Input,
   InputNumber,
+  Modal,
   Popconfirm,
   Row,
   Select,
@@ -19,14 +21,26 @@ import {
   Switch,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
-import { DeleteOutlined, EditOutlined, PlusOutlined, ThunderboltOutlined } from '@ant-design/icons';
+import {
+  DeleteOutlined,
+  EditOutlined,
+  PlusOutlined,
+  ThunderboltOutlined,
+} from '@ant-design/icons';
 import dayjs from 'dayjs';
 import { useSampleStore } from '../stores/sampleStore';
 import { useDeviceStore } from '../stores/deviceStore';
 import type { SampleDraft, SampleRow as SampleViewRow, StringDiscreteStat } from '../types/sample';
+import {
+  IRRADIANCE_SOURCE_LABEL,
+  SAMPLE_EXCLUDE_REASON_LABEL,
+  type SampleExcludeReason,
+} from '../types/sample';
 import { normalizeCurrent } from '../utils/discrete';
+import { FALLBACK_MAX_AGE_MIN } from '../utils/irradiance';
 import { formatCurrent, formatIrradiance, formatPercent, formatVoltage, share } from '../utils/unit';
 import DiscreteBadge from '../components/common/DiscreteBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
@@ -38,7 +52,8 @@ interface SampleFormValues {
   sampledAt: dayjs.Dayjs;
   currentA: number;
   voltageV: number;
-  irradianceWm2: number;
+  /** 允许留空：辐照度缺失时由系统按同箱中位数 / 上一条有效值补全 */
+  irradianceWm2: number | null;
 }
 
 interface BatchRow {
@@ -59,6 +74,7 @@ export default function SampleEntry() {
   const addBatchSamples = useSampleStore((state) => state.addBatchSamples);
   const updateSample = useSampleStore((state) => state.updateSample);
   const deleteSample = useSampleStore((state) => state.deleteSample);
+  const setSampleExcluded = useSampleStore((state) => state.setSampleExcluded);
   const toggleMark = useSampleStore((state) => state.toggleMark);
   const markedStringIds = useSampleStore((state) => state.markedStringIds);
 
@@ -70,17 +86,22 @@ export default function SampleEntry() {
   const keyword = useKeywordFilter();
   const filters = useFilterValues(['plant', 'inverter', 'level']);
   const [form] = Form.useForm<SampleFormValues>();
+  const [excludeForm] = Form.useForm<{ reasonPreset: SampleExcludeReason; note: string }>();
   const [modal, setModal] = useState<{ open: boolean; editing: SampleViewRow | null }>({
     open: false,
     editing: null,
   });
+  /** 剔除原因弹窗目标（null 表示关闭） */
+  const [excludeTarget, setExcludeTarget] = useState<SampleViewRow | null>(null);
   const [batchOpen, setBatchOpen] = useState(false);
-  const [batchBox, setBatchBox] = useState<string>('');
   const [batchInverter, setBatchInverter] = useState<string>('');
+  const [batchBox, setBatchBox] = useState<string>('');
   const [batchTime, setBatchTime] = useState<dayjs.Dayjs>(dayjs());
-  const [batchIrradiance, setBatchIrradiance] = useState<number>(900);
+  const [batchIrradiance, setBatchIrradiance] = useState<number | null>(900);
   const [batchRows, setBatchRows] = useState<BatchRow[]>([]);
   const [onlySuspicious, setOnlySuspicious] = useState(false);
+  /** 表格默认展示全部原始读数（含已剔除）；打开后只看计入统计的读数 */
+  const [hideExcluded, setHideExcluded] = useState(false);
 
   const rows = sampleRows();
   const plantFilter = filters.plant ?? [];
@@ -96,6 +117,7 @@ export default function SampleEntry() {
   const filtered = useMemo(() => {
     const lower = keyword.trim().toLowerCase();
     return rows.filter((row) => {
+      if (hideExcluded && !row.countedInStats) return false;
       if (plantFilter.length > 0 && !plantFilter.includes(row.plantId)) return false;
       if (inverterFilter.length > 0 && !inverterFilter.includes(row.inverterId)) return false;
       const level = statOfString.get(row.stringId)?.level ?? 'normal';
@@ -109,11 +131,12 @@ export default function SampleEntry() {
       }
       return true;
     });
-  }, [rows, keyword, plantFilter, inverterFilter, levelFilter, onlySuspicious, statOfString]);
+  }, [rows, keyword, plantFilter, inverterFilter, levelFilter, onlySuspicious, hideExcluded, statOfString]);
 
   const totals = useMemo(() => {
     const mismatch = stats.filter((stat) => stat.level === 'mismatch').length;
     const watch = stats.filter((stat) => stat.level === 'watch').length;
+    const excluded = rows.filter((row) => !row.countedInStats).length;
     const avgRate =
       stats.length === 0
         ? 0
@@ -123,10 +146,11 @@ export default function SampleEntry() {
       strings: stats.length,
       mismatch,
       watch,
+      excluded,
       avgRate,
       mismatchShare: share(mismatch, stats.length),
     };
-  }, [stats, samples.length]);
+  }, [stats, samples.length, rows]);
 
   /** 汇流箱候选（用于批量录入） */
   const boxOptions = useMemo(() => {
@@ -163,14 +187,18 @@ export default function SampleEntry() {
       sampledAt: values.sampledAt.format('YYYY-MM-DD HH:mm'),
       currentA: values.currentA,
       voltageV: values.voltageV,
-      irradianceWm2: values.irradianceWm2,
+      // 留空（null）即辐照度缺失：系统按同箱中位数 → 上一条有效值补全
+      irradianceWm2: values.irradianceWm2 === null ? null : Number(values.irradianceWm2),
     };
     if (modal.editing) {
       await updateSample(modal.editing.id, draft);
-      message.success('采集记录已更新，离散率已重算');
+      message.success('采集记录已更新，离散率已按剩余读数重算');
     } else {
       await addSample(draft);
       const rate = statOfString.get(draft.stringId)?.discreteRate ?? 0;
+      if (draft.irradianceWm2 === null) {
+        message.info('辐照度缺失已登记：优先取同次同箱中位数，整箱都缺则沿用上一条有效值（30 分钟内）');
+      }
       message.success(
         rate >= thresholds.discreteAlarmRate
           ? `已录入：该汇流箱离散率 ${rate}%，已达失配阈值，建议建处置单`
@@ -178,6 +206,29 @@ export default function SampleEntry() {
       );
     }
     setModal({ open: false, editing: null });
+  };
+
+  /** 打开剔除原因弹窗（云影为默认原因） */
+  const openExclude = (row: SampleViewRow): void => {
+    setExcludeTarget(row);
+    excludeForm.setFieldsValue({ reasonPreset: 'cloud', note: row.excludeReason ?? '' });
+  };
+
+  const submitExclude = async (): Promise<void> => {
+    if (!excludeTarget) return;
+    const values = await excludeForm.validateFields();
+    const presetText = SAMPLE_EXCLUDE_REASON_LABEL[values.reasonPreset];
+    const note = values.note?.trim();
+    const reason = note && note !== presetText ? `${presetText}：${note}` : presetText;
+    await setSampleExcluded(excludeTarget.id, true, reason);
+    message.success('已剔除该读数（原始记录保留），离散率榜与失配数已按剩余读数重算');
+    setExcludeTarget(null);
+    excludeForm.resetFields();
+  };
+
+  const restoreSample = async (row: SampleViewRow): Promise<void> => {
+    await setSampleExcluded(row.id, false);
+    message.success('已恢复计入统计，离散率榜与失配数已重算');
   };
 
   /** 依据汇流箱生成批量录入行 */
@@ -214,7 +265,8 @@ export default function SampleEntry() {
       sampledAt: batchTime.format('YYYY-MM-DD HH:mm'),
       currentA: row.currentA,
       voltageV: row.voltageV,
-      irradianceWm2: batchIrradiance,
+      // 整批留空表示这批采集辐照仪未上报：由系统逐点按同箱中位数 / 上一条有效值补全
+      irradianceWm2: batchIrradiance === null ? null : batchIrradiance,
     }));
     const created = await addBatchSamples(drafts);
     message.success(`已批量录入 ${created} 条采集记录并重算离散率`);
@@ -236,13 +288,17 @@ export default function SampleEntry() {
             采集与离散率
           </Typography.Title>
           <Typography.Text type="secondary">
-            按汇流箱录入组串电流电压，系统即时计算离散率并按阈值标红；辐照度不同自动做归一化修正。
+            按汇流箱录入组串电流电压，系统即时计算离散率并按阈值标红；云影读数可「不计入统计」但保留原始记录，辐照度缺失自动按同箱中位数 / 上一条有效值补全。
           </Typography.Text>
         </div>
         <Space wrap>
           <Space size={6}>
             <Typography.Text type="secondary">只看可疑</Typography.Text>
             <Switch checked={onlySuspicious} onChange={setOnlySuspicious} size="small" />
+          </Space>
+          <Space size={6}>
+            <Typography.Text type="secondary">隐藏已剔除</Typography.Text>
+            <Switch checked={hideExcluded} onChange={setHideExcluded} size="small" />
           </Space>
           <Button icon={<ThunderboltOutlined />} onClick={() => setBatchOpen(true)}>
             按汇流箱批量录入
@@ -254,14 +310,20 @@ export default function SampleEntry() {
       </div>
 
       <div className="gb-stat-grid">
-        <StatBadge title="采集记录" value={totals.samples} suffix="条" color="#1668dc" />
-        <StatBadge title="已采集组串" value={totals.strings} suffix="串" color="#0f7b6c" />
+        <StatBadge
+          title="采集记录（原始保留）"
+          value={totals.samples}
+          suffix="条"
+          color="#1668dc"
+          hint={`其中 ${totals.excluded} 条不计入统计`}
+        />
+        <StatBadge title="在册统计组串" value={totals.strings} suffix="串" color="#0f7b6c" />
         <StatBadge
           title="平均离散率"
           value={totals.avgRate}
           suffix="%"
           color={totals.avgRate >= thresholds.discreteWatchRate ? '#d46b08' : '#237804'}
-          hint={`关注 ≥ ${thresholds.discreteWatchRate}%，失配 ≥ ${thresholds.discreteAlarmRate}%`}
+          hint={`关注 ≥ ${thresholds.discreteWatchRate}%，失配 ≥ ${thresholds.discreteAlarmRate}%（按剩余读数）`}
         />
         <StatBadge
           title="失配组串"
@@ -269,7 +331,7 @@ export default function SampleEntry() {
           suffix={`/ ${totals.strings}`}
           percent={totals.mismatchShare}
           color="#a8071a"
-          hint={`关注档 ${totals.watch} 串`}
+          hint={`关注档 ${totals.watch} 串；剔除 ${totals.excluded} 条后重算`}
         />
       </div>
 
@@ -327,7 +389,8 @@ export default function SampleEntry() {
                 size="small"
                 dataSource={filtered}
                 pagination={{ pageSize: 10, size: 'small' }}
-                scroll={{ x: 1180 }}
+                scroll={{ x: 1420 }}
+                rowClassName={(row) => (row.countedInStats ? '' : 'gb-sample-row is-excluded')}
                 columns={[
                   { title: '采集时间', dataIndex: 'sampledAt', width: 140 },
                   {
@@ -338,22 +401,38 @@ export default function SampleEntry() {
                   },
                   { title: '组串', width: 140, render: (_, row) => `${row.combinerBox} · ${row.stringCode}` },
                   {
-                    title: '电流',
+                    title: '原始电流',
                     dataIndex: 'currentA',
                     width: 100,
                     render: (value: number) => formatCurrent(value),
                   },
                   {
-                    title: '辐照度',
-                    dataIndex: 'irradianceWm2',
-                    width: 110,
-                    render: (value: number) => formatIrradiance(value),
+                    title: '辐照度 / 来源',
+                    width: 190,
+                    render: (_, row) => (
+                      <Space size={4} direction="vertical" style={{ lineHeight: 1.2 }}>
+                        <span>{formatIrradiance(row.irradianceWm2)}</span>
+                        {row.irradianceSource === 'measured' ? null : (
+                          <Tag
+                            color={row.irradianceSource === 'previous' && !row.countedInStats ? 'red' : 'orange'}
+                            style={{ marginInlineEnd: 0 }}
+                          >
+                            {IRRADIANCE_SOURCE_LABEL[row.irradianceSource]}
+                          </Tag>
+                        )}
+                      </Space>
+                    ),
                   },
                   {
                     title: '归一化电流',
                     dataIndex: 'normalizedCurrentA',
                     width: 120,
-                    render: (value: number) => formatCurrent(value),
+                    render: (value: number, row) =>
+                      row.countedInStats ? (
+                        formatCurrent(value)
+                      ) : (
+                        <span className="gb-hint">{formatCurrent(value)}（不计入）</span>
+                      ),
                   },
                   {
                     title: '电压',
@@ -373,6 +452,53 @@ export default function SampleEntry() {
                           biasPercent={stat?.currentBiasPercent}
                           sampleCount={stat?.sampleCount}
                           size="small"
+                        />
+                      );
+                    },
+                  },
+                  {
+                    title: (
+                      <Tooltip
+                        title={`剔除后原始读数保留可查看，榜单与失配数按剩余读数重算；恢复计入同样自动重算。补全辐照度沿用超过 ${FALLBACK_MAX_AGE_MIN} 分钟自动退出统计。`}
+                      >
+                        <span>计入统计</span>
+                      </Tooltip>
+                    ),
+                    width: 150,
+                    render: (_, row) => {
+                      if (!row.countedInStats && !row.excludedFromStats) {
+                        // 补全辐照度过期自动退出统计：非人工剔除，需在 30 分钟有效期内补到实测值才会重新计入
+                        return (
+                          <Tooltip title={row.uncountedReason ?? '退出统计'}>
+                            <Tag color="red" style={{ marginInlineEnd: 0 }}>
+                              过期退出
+                            </Tag>
+                          </Tooltip>
+                        );
+                      }
+                      if (!row.countedInStats) {
+                        return (
+                          <Tooltip title={row.uncountedReason ?? '不计入统计'}>
+                            <Space size={4} direction="vertical" style={{ lineHeight: 1.2 }}>
+                              <Switch
+                                size="small"
+                                checked={false}
+                                onChange={() => void restoreSample(row)}
+                              />
+                              <Tag color="default" style={{ marginInlineEnd: 0 }}>
+                                已剔除 · 可恢复
+                              </Tag>
+                            </Space>
+                          </Tooltip>
+                        );
+                      }
+                      return (
+                        <Switch
+                          size="small"
+                          checked
+                          onChange={() => openExclude(row)}
+                          checkedChildren="计入"
+                          unCheckedChildren="剔除"
                         />
                       );
                     },
@@ -456,7 +582,8 @@ export default function SampleEntry() {
             )}
             <Typography.Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0 }}>
               归一化基准辐照度 {thresholds.standardIrradiance} W/m²；电流偏差 ≥{' '}
-              {thresholds.currentBiasPercent}% 判可疑；最少采集点数 {thresholds.minSampleCount}。
+              {thresholds.currentBiasPercent}% 判可疑；最少采集点数 {thresholds.minSampleCount}
+              。榜单仅按「计入统计」的读数计算，剔除/过期读数保留在原始记录中。
             </Typography.Paragraph>
           </Card>
         </Col>
@@ -500,16 +627,22 @@ export default function SampleEntry() {
           <Form.Item name="voltageV" label="电压（V）" rules={[{ required: true, message: '请输入电压' }]}>
             <InputNumber min={0} max={2000} step={0.1} style={{ width: '100%' }} />
           </Form.Item>
-          <Form.Item name="irradianceWm2" label="辐照度（W/m²）" rules={[{ required: true, message: '请输入辐照度' }]}>
-            <InputNumber min={0} max={1400} step={10} style={{ width: '100%' }} />
+          <Form.Item
+            name="irradianceWm2"
+            label="辐照度（W/m²，可留空表示未上报）"
+            extra="留空时系统优先取同次同汇流箱其他组串实测中位数；整箱都缺则沿用本组串上一条有效值，间隔超过 30 分钟退出统计。"
+          >
+            <InputNumber min={0} max={1400} step={10} style={{ width: '100%' }} placeholder="留空 = 辐照度缺失" />
           </Form.Item>
           <Form.Item noStyle shouldUpdate>
             {() => {
               const current = Number(form.getFieldValue('currentA') ?? 0);
-              const irradiance = Number(form.getFieldValue('irradianceWm2') ?? 0);
+              const irradiance = form.getFieldValue('irradianceWm2');
               return (
                 <Typography.Paragraph type="secondary">
-                  归一化电流预览：{formatCurrent(normalizeCurrent(current, irradiance, thresholds))}
+                  {irradiance === null || irradiance === undefined
+                    ? '辐照度缺失：归一化将使用补全值（同箱中位数 / 上一条有效值）'
+                    : `归一化电流预览：${formatCurrent(normalizeCurrent(current, Number(irradiance), thresholds))}`}
                 </Typography.Paragraph>
               );
             }}
@@ -563,8 +696,9 @@ export default function SampleEntry() {
             max={1400}
             step={10}
             value={batchIrradiance}
-            onChange={(value) => setBatchIrradiance(Number(value ?? 0))}
+            onChange={(value) => setBatchIrradiance(value === null ? null : Number(value))}
             addonAfter="W/m²"
+            placeholder="留空=缺失"
           />
           <Button onClick={buildBatchRows}>生成清单</Button>
         </Space>
@@ -625,17 +759,57 @@ export default function SampleEntry() {
               {
                 title: '归一化电流',
                 width: 120,
-                render: (_, row) => formatCurrent(normalizeCurrent(row.currentA, batchIrradiance, thresholds)),
+                render: (_, row) =>
+                  batchIrradiance === null
+                    ? '按补全值计算'
+                    : formatCurrent(normalizeCurrent(row.currentA, batchIrradiance, thresholds)),
               },
             ]}
           />
         )}
 
         <Typography.Paragraph type="secondary" style={{ marginTop: 12 }}>
-          提示：批量录入后系统按汇流箱分组重算离散率，离散率 = 组串归一化电流标准差 / 均值 × 100%。当前可疑偏差阈值{' '}
+          提示：批量录入后系统按汇流箱分组重算离散率，离散率 = 组串归一化电流标准差 / 均值 × 100%，仅统计未剔除读数。
+          辐照度留空时按「同箱中位数 → 上一条有效值（30 分钟内）」补全。当前可疑偏差阈值{' '}
           {formatPercent(thresholds.currentBiasPercent, 0)}。
         </Typography.Paragraph>
       </Drawer>
+
+      {/* 剔除统计（云影复核）：保留原始记录，仅关闭统计开关，可随时恢复 */}
+      <Modal
+        title="剔除该读数（不计入统计）"
+        open={Boolean(excludeTarget)}
+        onCancel={() => setExcludeTarget(null)}
+        onOk={() => void submitExclude()}
+        okText="确认剔除"
+        cancelText="取消"
+      >
+        {excludeTarget ? (
+          <Space direction="vertical" size={10} style={{ width: '100%' }}>
+            <Typography.Text type="secondary">
+              {excludeTarget.sampledAt} · {excludeTarget.combinerBox} · {excludeTarget.stringCode} · 原始电流{' '}
+              {formatCurrent(excludeTarget.currentA)}
+            </Typography.Text>
+            <Typography.Paragraph type="warning" style={{ marginBottom: 0 }}>
+              原始读数会完整保留并可查看，离散率榜与失配数立即按剩余读数重算；之后恢复计入同样自动重算。
+            </Typography.Paragraph>
+            <Form form={excludeForm} layout="vertical" style={{ marginTop: 4 }}>
+              <Form.Item name="reasonPreset" label="剔除原因" rules={[{ required: true }]}>
+                <Select
+                  options={[
+                    { label: SAMPLE_EXCLUDE_REASON_LABEL.cloud, value: 'cloud' },
+                    { label: SAMPLE_EXCLUDE_REASON_LABEL.device, value: 'device' },
+                    { label: SAMPLE_EXCLUDE_REASON_LABEL.other, value: 'other' },
+                  ]}
+                />
+              </Form.Item>
+              <Form.Item name="note" label="备注（可选）">
+                <Input.TextArea rows={2} placeholder="如：10:50-11:10 积云过境，与云图记录一致" />
+              </Form.Item>
+            </Form>
+          </Space>
+        ) : null}
+      </Modal>
     </div>
   );
 }

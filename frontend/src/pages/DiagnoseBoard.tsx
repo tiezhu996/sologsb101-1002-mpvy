@@ -19,6 +19,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
 import {
@@ -32,7 +33,7 @@ import { useDeviceStore } from '../stores/deviceStore';
 import { useDisposalStore } from '../stores/disposalStore';
 import { useCompareGroup, useStringRank } from '../hooks/useStringRank';
 import type { StringDiscreteStat } from '../types/sample';
-import { DISCRETE_LEVEL_LABEL } from '../types/sample';
+import { DISCRETE_LEVEL_LABEL, IRRADIANCE_SOURCE_LABEL } from '../types/sample';
 import { groupKeyOf } from '../utils/discrete';
 import { formatCurrent, formatPercent, share } from '../utils/unit';
 import { shiftDate } from '../utils/format';
@@ -47,7 +48,7 @@ export default function DiagnoseBoard() {
   const navigate = useNavigate();
   const { message } = AntdApp.useApp();
   const thresholds = useSampleStore((state) => state.thresholds);
-  const samplesOfString = useSampleStore((state) => state.samplesOfString);
+  const sampleRows = useSampleStore((state) => state.sampleRows);
   const markedStringIds = useSampleStore((state) => state.markedStringIds);
   const toggleMark = useSampleStore((state) => state.toggleMark);
   const markMany = useSampleStore((state) => state.markMany);
@@ -98,9 +99,9 @@ export default function DiagnoseBoard() {
   const { sameBox, sameInverter, target } = useCompareGroup(detailId);
 
   const detailSamples = useMemo(
-    () => (detailId ? samplesOfString(detailId).slice(-10) : []),
+    () => (detailId ? sampleRows().filter((row) => row.stringId === detailId).slice(-10) : []),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [detailId, samplesOfString],
+    [detailId, sampleRows],
   );
 
   const detailString = strings.find((item) => item.id === detailId) ?? null;
@@ -162,7 +163,7 @@ export default function DiagnoseBoard() {
             失配排查工作台
           </Typography.Title>
           <Typography.Text type="secondary">
-            按离散率与电流偏差排序定位可疑组串，支持人工标记、同汇流箱/同逆变器对比追溯与一键派单。
+            按离散率与电流偏差排序定位可疑组串，支持人工标记、同汇流箱/同逆变器对比追溯与一键派单；剔除/过期读数不参与统计，恢复计入后榜单自动重算。
           </Typography.Text>
         </div>
         <Space wrap>
@@ -330,7 +331,32 @@ export default function DiagnoseBoard() {
                     width: 105,
                     render: (value: number) => formatCurrent(value),
                   },
-                  { title: '采集点数', dataIndex: 'sampleCount', width: 95 },
+                  {
+                    title: (
+                      <Tooltip title="计入统计的读数数 / 原始读数总数；被云影复核剔除或补全辐照度过期的读数不计入">
+                        <span>计入 / 总读数</span>
+                      </Tooltip>
+                    ),
+                    dataIndex: 'sampleCount',
+                    width: 120,
+                    render: (_, row) => (
+                      <Space size={4}>
+                        <span>
+                          {row.sampleCount} / {row.totalSampleCount}
+                        </span>
+                        {row.excludedCount > 0 ? (
+                          <Tag color="default" style={{ marginInlineEnd: 0 }}>
+                            剔 {row.excludedCount}
+                          </Tag>
+                        ) : null}
+                        {row.staleCount > 0 ? (
+                          <Tag color="red" style={{ marginInlineEnd: 0 }}>
+                            过期 {row.staleCount}
+                          </Tag>
+                        ) : null}
+                      </Space>
+                    ),
+                  },
                   { title: '最后采集', dataIndex: 'lastSampledAt', width: 145 },
                   {
                     title: '未闭环处置',
@@ -529,7 +555,7 @@ export default function DiagnoseBoard() {
                 </Card>
               </Col>
               <Col span={12}>
-                <Card size="small" title="本串最近采集序列" styles={{ body: { padding: 8 } }}>
+                <Card size="small" title="本串最近采集序列（原始读数保留）" styles={{ body: { padding: 8 } }}>
                   {detailSamples.length === 0 ? (
                     <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无采集" />
                   ) : (
@@ -538,6 +564,7 @@ export default function DiagnoseBoard() {
                       size="small"
                       pagination={false}
                       dataSource={detailSamples}
+                      rowClassName={(row) => (row.countedInStats ? '' : 'gb-sample-row is-excluded')}
                       columns={[
                         { title: '时间', dataIndex: 'sampledAt', width: 130 },
                         {
@@ -548,12 +575,38 @@ export default function DiagnoseBoard() {
                         {
                           title: '辐照度',
                           dataIndex: 'irradianceWm2',
-                          render: (value: number) => `${value} W/m²`,
+                          render: (value: number | null, row) => (
+                            <Space size={4} direction="vertical" style={{ lineHeight: 1.2 }}>
+                              <span>{value === null ? '未上报' : `${value} W/m²`}</span>
+                              {row.irradianceSource !== 'measured' ? (
+                                <Tag
+                                  color={row.countedInStats ? 'orange' : 'red'}
+                                  style={{ marginInlineEnd: 0 }}
+                                >
+                                  {IRRADIANCE_SOURCE_LABEL[row.irradianceSource]}
+                                </Tag>
+                              ) : null}
+                            </Space>
+                          ),
                         },
                         {
                           title: '离散率',
                           dataIndex: 'discreteRate',
                           render: (value: number) => `${value.toFixed(2)}%`,
+                        },
+                        {
+                          title: '统计',
+                          width: 100,
+                          render: (_, row) =>
+                            row.countedInStats ? (
+                              <Tag color="success">计入</Tag>
+                            ) : (
+                              <Tooltip title={row.uncountedReason ?? '不计入统计'}>
+                                <Tag color={row.excludedFromStats ? 'default' : 'red'}>
+                                  {row.excludedFromStats ? '已剔除' : '过期退出'}
+                                </Tag>
+                              </Tooltip>
+                            ),
                         },
                       ]}
                     />
